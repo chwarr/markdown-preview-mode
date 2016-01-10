@@ -5,7 +5,7 @@
 ;; Author: Igor Shymko <igor.shimko@gmail.com>
 ;; URL: https://github.com/ancane/markdown-preview-mode
 ;; Keywords: markdown, preview
-;; Package-Requires: ((websocket "1.3") (markdown-mode "2.0") (cl-lib "0.5"))
+;; Package-Requires: ((websocket "1.5") (markdown-mode "2.1") (cl-lib "0.5"))
 
 ;; This file is not part of GNU Emacs.
 
@@ -22,6 +22,12 @@
 ;; You should have received a copy of the GNU General Public License
 ;; along with GNU Emacs.  If not, see <http://www.gnu.org/licenses/>.
 
+;;; Commentary:
+;;
+;; This package makes use of websocket server and 2 client connections
+;; to deliver rendered markdown to a web browser. Updates happen upon
+;; buffer save or idle.
+;;
 ;;; Code:
 
 (require 'cl-lib)
@@ -31,77 +37,81 @@
 (defgroup markdown-preview nil
   "Markdown preview mode"
   :group 'text
-  :prefix "mdpm:"
+  :prefix "markdown-preview"
   :link '(url-link "https://github.com/ancane/markdown-preview-mode"))
 
 (defcustom markdown-preview-port 7379
-  "Markdown preview websocket server port"
+  "Markdown preview websocket server port."
   :group 'markdown-preview
   :type 'integer)
 
 (defcustom markdown-preview-style "http://thomasf.github.io/solarized-css/solarized-dark.min.css"
-  "Markdown preview style URI"
+  "Markdown preview style URI."
   :group 'markdown-preview
   :type 'string)
 
-(defvar mdpm:websocket-server nil)
-(defvar mdpm:local-client nil)
-(defvar mdpm:remote-clients nil)
-(defvar mdpm:preview-url (concat (file-name-directory load-file-name) "preview.html"))
-(defvar mdpm:idle-timer nil "Preview idle timer")
+(defvar markdown-preview--websocket-server nil)
+(defvar markdown-preview--local-client nil)
+(defvar markdown-preview--remote-clients nil)
+(defvar markdown-preview--preview-url (concat (file-name-directory load-file-name) "preview.html"))
+(defvar markdown-preview--idle-timer nil "Preview idle timer.")
 
-(defun mdpm:stop-idle-timer ()
-  (when (timerp mdpm:idle-timer)
-    (cancel-timer mdpm:idle-timer)))
+(defun markdown-preview--stop-idle-timer ()
+  "Cancel preview idle timer."
+  (when (timerp markdown-preview--idle-timer)
+    (cancel-timer markdown-preview--idle-timer)))
 
-(defun mdpm:open-browser-preview ()
-  (browse-url mdpm:preview-url))
+(defun markdown-preview--stop-websocket-server ()
+  "Close server socket and stop server."
+  (when markdown-preview--local-client
+    (websocket-close markdown-preview--local-client))
+  (when markdown-preview--websocket-server
+    (delete-process markdown-preview--websocket-server)
+    (setq markdown-preview--websocket-server nil
+          markdown-preview--remote-clients nil)))
 
-(defun mdpm:stop-websocket-server ()
-  (when mdpm:local-client
-    (websocket-close mdpm:local-client))
-  (when mdpm:websocket-server
-    (delete-process mdpm:websocket-server)
-    (setq mdpm:websocket-server nil
-          mdpm:remote-clients nil)))
+(defun markdown-preview--drop-closed-clients ()
+  "Clean up closed client connections."
+  (setq markdown-preview--remote-clients
+        (cl-remove-if-not #'websocket-openp markdown-preview--remote-clients)))
 
-(defun mdpm:drop-closed-clients ()
-  (setq mdpm:remote-clients
-        (cl-remove-if-not #'websocket-openp mdpm:remote-clients)))
-
-(defun mdpm:start-websocket-server ()
-  (when (not mdpm:websocket-server)
-    (setq mdpm:websocket-server
+(defun markdown-preview--start-websocket-server ()
+  "Start websocket server."
+  (when (not markdown-preview--websocket-server)
+    (setq markdown-preview--websocket-server
           (websocket-server
            markdown-preview-port
            :on-message (lambda (websocket frame)
                          (mapc (lambda (ws)
                                  (websocket-send-text ws
                                                       (websocket-frame-payload frame)))
-                               mdpm:remote-clients))
+                               markdown-preview--remote-clients))
            :on-open (lambda (websocket)
-                      (push websocket mdpm:remote-clients)
-                      (mdpm:send-preview-to websocket))
+                      (push websocket markdown-preview--remote-clients)
+                      (markdown-preview--send-to websocket))
            :on-error (lambda (websocket type err) (message (concat "====> Error:" err)))
-           :on-close (lambda (websocket) (mdpm:drop-closed-clients))))
-    (add-hook 'kill-emacs-hook 'mdpm:stop-websocket-server)
-    (mdpm:open-browser-preview)))
+           :on-close (lambda (websocket) (markdown-preview--drop-closed-clients))))
+    (add-hook 'kill-emacs-hook 'markdown-preview--stop-websocket-server)
+    (markdown-preview-open-browser)))
 
-(defun mdpm:start-local-client ()
-  (when (not mdpm:local-client)
-    (setq mdpm:local-client
+(defun markdown-preview--start-local-client ()
+ "Establish local client connection, listening for markdown edits."
+  (when (not markdown-preview--local-client)
+    (setq markdown-preview--local-client
           (websocket-open
            (format "ws://localhost:%d" markdown-preview-port)
            :on-error (lambda (ws type err)
                        (message "error connecting"))
            :on-close (lambda (websocket)
-                       (setq mdpm:local-client nil))))))
+                       (setq markdown-preview--local-client nil))))))
 
-(defun mdpm:send-preview ()
+(defun markdown-preview--send ()
+  "Send updated markdown preview to the server via local client connection."
   (when (bound-and-true-p markdown-preview-mode)
-    (mdpm:send-preview-to mdpm:local-client)))
+    (markdown-preview--send-to markdown-preview--local-client)))
 
-(defun mdpm:send-preview-to (websocket)
+(defun markdown-preview--send-to (websocket)
+  "Render markdown preview and send it via client WEBSOCKET to the server."
   (let ((mark-position-percent
          (number-to-string
           (truncate
@@ -127,38 +137,42 @@
                             "</div>")
                            ))))
 
-(defun mdpm:start ()
-  (mdpm:start-websocket-server)
-  (mdpm:start-local-client)
-  (setq mdpm:idle-timer
-        (run-with-idle-timer 2 t 'mdpm:send-preview))
-  (add-hook 'after-save-hook 'mdpm:send-preview nil t)
-  (add-hook 'kill-buffer-hook 'mdpm:stop))
+(defun markdown-preview--start ()
+  "Setup markdown preview mode."
+  (markdown-preview--start-websocket-server)
+  (markdown-preview--start-local-client)
+  (setq markdown-preview--idle-timer
+        (run-with-idle-timer 2 t 'markdown-preview--send))
+  (add-hook 'after-save-hook 'markdown-preview--send nil t)
+  (add-hook 'kill-buffer-hook 'markdown-preview--stop))
 
-(defun mdpm:stop ()
-  (remove-hook 'after-save-hook 'mdpm:send-preview t)
-  (mdpm:stop-idle-timer))
+(defun markdown-preview--stop ()
+  "Perform markdown preview mode clenups."
+  (remove-hook 'after-save-hook 'markdown-preview--send t)
+  (markdown-preview--stop-idle-timer))
 
 (defun markdown-preview-open-browser ()
+  "Open markdown preview in a web browser."
   (interactive)
-  (mdpm:open-browser-preview))
+  (browse-url markdown-preview--preview-url))
 
 (defun markdown-preview-cleanup ()
+  "Close websocket server and client connection."
   (interactive)
-  (mdpm:stop-websocket-server))
+  (markdown-preview--stop-websocket-server))
 
 ;;;###autoload
 (define-minor-mode markdown-preview-mode
-  "Markdown preview mode"
-  :group 'markdown-preview-mode
+  "Markdown preview mode."
+  :group 'markdown-preview
   :init-value nil
   (when (not (or
               (equal major-mode 'markdown-mode)
               (equal major-mode 'gfm-mode)))
     (markdown-mode))
   (if markdown-preview-mode
-      (mdpm:start)
-    (mdpm:stop)))
+      (markdown-preview--start)
+    (markdown-preview--stop)))
 
 (provide 'markdown-preview-mode)
 
